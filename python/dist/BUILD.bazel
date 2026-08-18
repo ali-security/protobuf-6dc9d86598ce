@@ -317,9 +317,14 @@ py_wheel(
     homepage = "https://developers.google.com/protocol-buffers/",
     license = "3-Clause BSD License",
     platform = select({
-        ":linux_x86_64_local": "linux_x86_64",
+        # Seal CI builds these wheels inside quay.io/pypa/manylinux2014_*
+        # containers instead of with //toolchain:clang_suite, so `release` is
+        # False and the *_local branch matches. Tag them manylinux2014 anyway:
+        # the container makes the tag truthful, and the published wheels carry
+        # it in dist-info/WHEEL as well as in the filename.
+        ":linux_x86_64_local": "manylinux2014_x86_64",
         ":linux_x86_64_release": "manylinux2014_x86_64",
-        ":linux_aarch64_local": "linux_aarch64",
+        ":linux_aarch64_local": "manylinux2014_aarch64",
         ":linux_aarch64_release": "manylinux2014_aarch64",
         ":osx_universal2": "macosx_10_9_universal2",
         ":osx_aarch64": "macosx_11_0_arm64",

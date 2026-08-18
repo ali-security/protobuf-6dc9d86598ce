@@ -1,0 +1,320 @@
+name: Build Python Wheels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64-wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014_x86_64
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/protobuf -w /protobuf \
+            quay.io/pypa/manylinux2014_x86_64:2023-01-01-bd00b6b bash -c '
+              source /opt/rh/devtoolset-10/enable
+              export PATH=/opt/python/cp37-cp37m/bin:$PATH
+              ln -sf /opt/python/cp37-cp37m/bin/python3 /usr/bin/python3
+              curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+                -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+              pip install setuptools
+              bazel test //python/...
+              bazel build //python/dist:binary_wheel
+              mkdir -p wheels
+              # `bazel test //python/...` also leaves the pure-python and
+              # protobuftests wheels in this directory; upload only the
+              # platform wheel this job exists to produce.
+              cp bazel-bin/python/dist/protobuf-*-manylinux2014_x86_64.whl wheels/
+              chmod -R a+rX wheels
+              ls -l wheels/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-wheel
+          path: wheels/
+          if-no-files-found: error
+
+  linux-aarch64-wheel:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014_aarch64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/protobuf -w /protobuf \
+            quay.io/pypa/manylinux2014_aarch64:2023-01-01-bd00b6b bash -c '
+              source /opt/rh/devtoolset-10/enable
+              export PATH=/opt/python/cp37-cp37m/bin:$PATH
+              ln -sf /opt/python/cp37-cp37m/bin/python3 /usr/bin/python3
+              curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-arm64 \
+                -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+              sed -i '184,209d' WORKSPACE # This is because the cargo aarch64 requires glibc 2.18 but this has 2.17. Since its not needed I remove it here.
+              pip install setuptools
+              bazel test //python/...
+              bazel build //python/dist:binary_wheel
+              mkdir -p wheels
+              # See the x86_64 job: `bazel test` leaves other wheels here too.
+              cp bazel-bin/python/dist/protobuf-*-manylinux2014_aarch64.whl wheels/
+              chmod -R a+rX wheels
+              ls -l wheels/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-aarch64-wheel
+          path: wheels/
+          if-no-files-found: error
+
+  macos-wheel:
+    # x86_64 macOS: CPython 3.7 has no arm64 darwin build, and the wheel's
+    # python_tag falls through to "cp" + SYSTEM_PYTHON_VERSION (the runner's
+    # python3), so the runner MUST host a 3.7 interpreter to tag the wheel cp37.
+    # bazel still cross-compiles the arm64 slice: the --cpu=osx-universal2 split
+    # transition in python/dist/dist.bzl builds darwin_arm64 alongside
+    # darwin_x86_64 and llvm-lipo fuses them into one fat Mach-O.
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: MatteoH2O1999/setup-python@v6
+        with:
+          python-version: "3.7"
+      - name: Restore libarclite for old deployment targets
+        run: |
+          XCODE_PATH=$(xcode-select -p)
+          ARC_DIR="${XCODE_PATH}/Toolchains/XcodeDefault.xctoolchain/usr/lib/arc"
+          sudo git clone https://github.com/kamyarelyasi/Libarclite-Files.git /tmp/libarclite
+          sudo mkdir -p "$ARC_DIR"
+          sudo cp -R /tmp/libarclite/. "$ARC_DIR"/
+      - name: Install bazelisk and llvm-lipo
+        run: |
+          brew install bazelisk llvm
+          # python/dist/dist.bzl fuses the x86_64 + arm64 slices by invoking the
+          # HARDCODED path /usr/local/bin/llvm-lipo; brew keeps llvm keg-only.
+          sudo mkdir -p /usr/local/bin
+          sudo ln -sf "$(brew --prefix llvm)/bin/llvm-lipo" /usr/local/bin/llvm-lipo
+          /usr/local/bin/llvm-lipo -version
+      - name: Build universal2 wheel
+        run: |
+          pip install setuptools
+          bazel sync --configure
+          bazel test //python/...
+          # --cpu=osx-universal2 stays: python/dist/BUILD.bazel's `platform`
+          # select keys the macosx_10_9_universal2 tag off exactly that value,
+          # and python/dist/dist.bzl split-transitions the _message extension
+          # from it to darwin_arm64 + darwin_x86_64, both of which bazel's
+          # native @local_config_cc provides. Deliberately NOT passing
+          # --apple_platform_type / --incompatible_enable_apple_toolchain_resolution:
+          # bazel 6 resolves cc rules through --cpu + the legacy crosstool, and
+          # the platform-resolution route is what left the split slices with no
+          # toolchain at all.
+          # Mach-O dependency parity with the published universal2 extension,
+          # whose every slice loads exactly libc++.1, libSystem.B and
+          # CoreFoundation:
+          #   -dead_strip_dylibs drops Foundation + libobjc.A. Those come from
+          #   the default link flags of bazel's native darwin crosstool, not from
+          #   this source tree, and no symbol in the extension resolves to
+          #   either; upstream built through //toolchain:clang_suite, which does
+          #   not add them.
+          #   -needed_framework,CoreFoundation and -needed-lc++ keep the two the
+          #   reference does load but dead_strip_dylibs would otherwise remove
+          #   (the extension reaches both only through weak/unused-at-link
+          #   references). libSystem.B is always retained.
+          #
+          # -c opt: the published universal2 extension is an optimized build —
+          # its own LC_ID_DYLIB records bazel-out/osx-aarch_64-opt-ST-…, and it
+          # is 638KB against 1.1MB for the same sources at fastbuild. opt also
+          # supplies -DNDEBUG, which upb/port/def.inc needs to compile
+          # UPB_ASSERT() away as it did for the release.
+          bazel build //python/dist:binary_wheel \
+            -c opt \
+            --//python:limited_api=True \
+            --//python:python_version=38 \
+            --macos_minimum_os=10.9 \
+            --action_env=MACOSX_DEPLOYMENT_TARGET=10.9 \
+            --linkopt=-Wl,-fixup_chains \
+            --linkopt=-Wl,-dead_strip_dylibs \
+            --linkopt=-Wl,-needed_framework,CoreFoundation \
+            --linkopt=-Wl,-needed-lc++ \
+            --cpu=osx-universal2
+          # `bazel test //python/...` above also leaves the pure-python and
+          # protobuftests wheels here; upload only this job's platform wheel.
+          mkdir -p wheels
+          cp bazel-bin/python/dist/protobuf-*-macosx_*_universal2.whl wheels/
+          ls -l wheels/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-wheel
+          path: wheels/
+          if-no-files-found: error
+
+  # The published Windows wheels are NOT built on Windows: they are
+  # cross-compiled from Linux with clang + mingw-w64, driven by
+  # toolchain/toolchains.bazelrc (--config=win32 / --config=win64 ->
+  # --config=cross_config --cpu=win32|win64 -> //toolchain:clang_suite).
+  # toolchain/BUILD.bazel's win32-config / win64-config hardcode Debian
+  # buster's mingw-w64 8.3-posix layout (sysroots /usr/{i686,x86_64}-w64-mingw32,
+  # -isystem/-L under /usr/lib/gcc/<triple>/8.3-posix), and
+  # toolchain/cc_toolchain_config.bzl hardcodes /usr/local/bin/clang,
+  # /usr/local/bin/llvm-ar and the include dir /usr/local/lib/clang.
+  # A native windows runner cannot satisfy any of that: @local_config_cc has no
+  # win32/win64 cpu, and //python:_message is
+  # target_compatible_with @platforms//:incompatible on @platforms//os:windows
+  # (the cross-build dodges it because the *host* platform stays Linux).
+  # buster is EOL, so apt is pointed at archive.debian.org.
+  # No `bazel test` here on purpose: the output is a Windows extension that
+  # cannot execute on the Linux host. Test coverage for //python/... comes from
+  # the linux-* and macos-wheel jobs in this same workflow.
+  windows-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bazel_cpu: win32
+            python_version: "38"
+            limited_api: "False"
+          - bazel_cpu: win64
+            python_version: "38"
+            limited_api: "False"
+          - bazel_cpu: win32
+            python_version: "39"
+            limited_api: "False"
+          - bazel_cpu: win64
+            python_version: "39"
+            limited_api: "False"
+          - bazel_cpu: win32
+            python_version: "310"
+            limited_api: "True"
+          - bazel_cpu: win64
+            python_version: "310"
+            limited_api: "True"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross-compile Windows wheel in debian:buster
+        env:
+          BAZEL_CPU: ${{ matrix.bazel_cpu }}
+          PYTHON_VERSION: ${{ matrix.python_version }}
+          LIMITED_API: ${{ matrix.limited_api }}
+        run: |
+          docker run --rm \
+            -e BAZEL_CPU -e PYTHON_VERSION -e LIMITED_API \
+            -v ${{ github.workspace }}:/protobuf -w /protobuf \
+            debian:buster bash -c '
+              set -euo pipefail
+
+              # buster is EOL: its packages only live on archive.debian.org and
+              # its Release files are past Valid-Until.
+              printf "%s\n" \
+                "deb http://archive.debian.org/debian buster main" \
+                "deb http://archive.debian.org/debian-security buster/updates main" \
+                > /etc/apt/sources.list
+              printf "%s\n" "Acquire::Check-Valid-Until \"false\";" \
+                > /etc/apt/apt.conf.d/99no-check-valid-until
+
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                clang llvm g++ g++-mingw-w64-i686 g++-mingw-w64-x86-64 \
+                curl ca-certificates unzip zip git \
+                python3 python3-pip python3-dev zlib1g-dev
+
+              # The toolchain configs name /usr/lib/gcc/<triple>/8.3-posix
+              # literally; if this image ever stops shipping mingw-w64 8.3, the
+              # cross-build must not silently fall back to something else.
+              ls -d /usr/lib/gcc/i686-w64-mingw32/8.3-posix \
+                    /usr/lib/gcc/x86_64-w64-mingw32/8.3-posix
+              ls -d /usr/i686-w64-mingw32 /usr/x86_64-w64-mingw32
+
+              # Hardcoded tool paths from toolchain/cc_toolchain_config.bzl.
+              mkdir -p /usr/local/bin /usr/local/lib
+              ln -sf "$(command -v clang)" /usr/local/bin/clang
+              LLVM_AR="$(command -v llvm-ar)" || \
+                LLVM_AR="$(ls /usr/lib/llvm-*/bin/llvm-ar | head -n1)"
+              ln -sf "$LLVM_AR" /usr/local/bin/llvm-ar
+              # linker_path for win32-config/win64-config is /usr/bin/ld
+              # (binutils), used both as the ld/compat-ld tool and as -B<path>.
+              test -x /usr/bin/ld
+              # cxx_builtin_include_directories lists /usr/local/lib/clang, so
+              # make it resolve to the parent of the clang resource dir, i.e.
+              # /usr/local/lib/clang/<ver>/include must exist.
+              CLANG_RES="$(clang -print-resource-dir)" || \
+                CLANG_RES="$(ls -d /usr/lib/llvm-*/lib/clang/* | head -n1)"
+              ln -sfn "$(dirname "$CLANG_RES")" /usr/local/lib/clang
+              test -d "/usr/local/lib/clang/$(basename "$CLANG_RES")/include"
+              /usr/local/bin/clang --version
+              /usr/local/bin/llvm-ar --version
+
+              curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+                -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+              pip3 install setuptools
+
+              # toolchain/toolchains.bazelrc is not imported by the workspace
+              # .bazelrc, so load it explicitly; --config=win32|win64 then
+              # supplies --cpu and the crosstool (never pass a bare --cpu).
+              #
+              # -DNDEBUG is required for import-table parity with the published
+              # .pyd. Without it upb/port/def.inc expands UPB_ASSERT() to libc
+              # assert(), and mingw-w64 satisfies that from
+              # libmingwex.a(wassert.o), which imports USER32.dll!MessageBoxW.
+              # The published .pyd imports only KERNEL32.dll, msvcrt.dll and
+              # pythonXY.dll. Upstream gets NDEBUG from the opt feature of
+              # //toolchain:clang_suite inside their private release container;
+              # this crosstool is loaded without that feature, so pass it here.
+              #
+              # NOTE for future edits: this whole script is the body of one
+              # single-quoted bash -c, so no line in it may contain an
+              # apostrophe. An apostrophe even in a comment closes the quote
+              # early, and the rest then runs on the HOST, where
+              # /usr/local/bin/clang does not exist and bazel dies with
+              # execvp(/usr/local/bin/clang): No such file or directory.
+              bazel --bazelrc=toolchain/toolchains.bazelrc \
+                build //python/dist:binary_wheel \
+                --config="$BAZEL_CPU" \
+                --//python:python_version="$PYTHON_VERSION" \
+                --//python:limited_api="$LIMITED_API" \
+                --copt=-DNDEBUG
+
+              mkdir -p wheels
+              cp bazel-bin/python/dist/*.whl wheels/
+              # The container runs as root; the host runner does not.
+              chmod -R a+rX wheels
+              ls -l wheels/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.bazel_cpu }}-cp${{ matrix.python_version }}-wheel
+          path: wheels/
+          if-no-files-found: error
+
+  pure-python-wheel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: MatteoH2O1999/setup-python@v6
+        with:
+          python-version: "3.7"
+      - name: Build pure python wheel
+        run: |
+          curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+            -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+          pip install setuptools
+          bazel test //python/...
+          bazel build //python/dist:pure_python_wheel && bazel build //python/dist:source_wheel
+          # `bazel test //python/...` also drops the cp37-abi3 platform wheel,
+          # the protobuftests wheel and bazel's internal protobuf.tar.gz /
+          # source_tarball.tar.gz staging copies into this directory. Upload
+          # only the two published platform-independent distributions,
+          # otherwise the same filename arrives from two jobs.
+          mkdir -p wheels
+          cp bazel-bin/python/dist/protobuf-*-py3-none-any.whl wheels/
+          cp bazel-bin/python/dist/protobuf-*.tar.gz wheels/
+          ls -l wheels/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pure-python-wheel
+          path: wheels/
+          if-no-files-found: error

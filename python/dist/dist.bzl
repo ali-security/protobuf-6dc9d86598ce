@@ -16,6 +16,9 @@ def _get_suffix(limited_api, python_version, cpu):
             fail("Unsupported CPU: " + cpu)
         return ".cp{}-{}.{}".format(python_version, abi, "pyd")
 
+    if limited_api:
+        return ".abi3.so"
+
     if python_version == "system":
         python_version = SYSTEM_PYTHON_VERSION
         if int(python_version) < 38:
@@ -27,6 +30,7 @@ def _get_suffix(limited_api, python_version, cpu):
             "osx-x86_64": "darwin",
             "osx-aarch_64": "darwin",
             "linux-aarch_64": "aarch64-linux-gnu",
+            "aarch64": "aarch64-linux-gnu",
             "linux-x86_64": "x86_64-linux-gnu",
             "k8": "x86_64-linux-gnu",
         }
@@ -34,10 +38,8 @@ def _get_suffix(limited_api, python_version, cpu):
         return ".cpython-{}-{}.{}".format(
             python_version,
             abis[cpu],
-            "so" if limited_api else "abi3.so",
+            "so",
         )
-    elif limited_api:
-        return ".abi3.so"
 
     fail("Unsupported combination of flags")
 
@@ -72,7 +74,15 @@ def _declare_module_file(ctx, module_name, python_version, limited_api):
 
 def _py_multiarch_transition_impl(settings, attr):
     if settings["//command_line_option:cpu"] == "osx-universal2":
-        return [{"//command_line_option:cpu": cpu} for cpu in ["osx-aarch_64", "osx-x86_64"]]
+        # Upstream splits to the cpu names "osx-aarch_64" / "osx-x86_64", which
+        # exist only in //toolchain:clang_suite. That crosstool hardcodes the
+        # sysroot /usr/tools/xcode_14_0/macosx from Google's private release
+        # container, so it is unusable here; a native macOS build then dies with
+        # "@local_config_cc//:toolchain does not contain a toolchain for cpu
+        # 'osx-aarch_64'". Seal CI builds this wheel on a macOS runner, where
+        # bazel's own @local_config_cc names the slices darwin_arm64 /
+        # darwin_x86_64.
+        return [{"//command_line_option:cpu": cpu} for cpu in ["darwin_arm64", "darwin_x86_64"]]
     else:
         return settings
 
